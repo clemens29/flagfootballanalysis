@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Rohdaten (GPS/FIT-Files können personenbezogen/groß sein)
+data/
+*.fit
+*.html
+
+# OS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+
+# LaTex
+*.aux
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.toc
+*.bbl
+*.blg
+*.synctex.gz

@@ -1,0 +1,111 @@
+\documentclass[a4paper, 11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+
+\usepackage{amsmath}
+\usepackage{geometry}
+\geometry{margin=2.5cm}
+
+\title{\textbf{Flag Football GPS-Analyse}\\[0.3em]\large Mathematische Ausdrücke}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+% -------------------------------------------------------
+\section*{1. GPS-Konvertierung: Semicircles $\to$ Grad}
+
+Garmin speichert Koordinaten als 32-Bit-Integer (Semicircles):
+
+\[
+  \text{lat}_{\deg} = \text{position\_lat}  \times \frac{180}{2^{31}}
+  \qquad
+  \text{lon}_{\deg} = \text{position\_long} \times \frac{180}{2^{31}}
+\]
+
+Ein voller Kreis umfasst $2^{32}$ Semicircles, ein Halbkreis ($180°$) entspricht $2^{31}$.
+
+% -------------------------------------------------------
+\section*{2. Geschwindigkeitsglättung (Rolling Mean)}
+
+GPS-Speed-Daten bei 1\,Hz sind verrauscht. Kurze Ausreißer-Peaks werden durch einen
+\textbf{zentrierten gleitenden Mittelwert} geglättet: jeder Wert wird durch den
+Durchschnitt seiner $w = 3$ Nachbarn (aktueller Punkt + je 1 Sekunde davor/danach) ersetzt.
+
+\[
+  \hat{v}(t) = \frac{1}{3} \sum_{k=-1}^{1} v_{\text{raw}}(t + k)
+\]
+
+\centering
+\textit{Beispiel:} Ein einzelner GPS-Spike auf $8{,}0\ \tfrac{\text{m}}{\text{s}}$
+bei sonst $4{,}0\ \tfrac{\text{m}}{\text{s}}$\\ wird auf
+$\frac{4{,}0 + 8{,}0 + 4{,}0}{3} = 5{,}3\ \tfrac{\text{m}}{\text{s}}$ reduziert
+
+% -------------------------------------------------------
+\section*{4. Sprint-Schwelle}
+
+Die Sprint-Schwelle wird \textbf{relativ zur persönlichen Maximalgeschwindigkeit}
+$v_{\max}^{\text{pers}}$ gesetzt (berechnet über alle Sessions). Ein fixer absoluter
+Wert (z.\,B.\ $18\ \tfrac{\text{km}}{\text{h}}$) wäre ungeeignet, da Amateure
+unterschiedliche Leistungsniveaus haben \cite{sfs_metrics}.
+
+\[
+  \theta_{\text{sprint}} = 0{,}60 \cdot v_{\max}^{\text{pers}}
+\]
+
+Ein Sample $t$ gilt als Sprint, wenn: \[\hat{v}(t) \;\geq\; \theta_{\text{sprint}}\]
+
+
+\textit{Beispiel mit $v_{\max}^{\text{pers}} = 6{,}75\ \tfrac{\text{m}}{\text{s}}$
+$(= 24{,}3\ \tfrac{\text{km}}{\text{h}})$:}
+\[
+  \theta_{\text{sprint}} = 0{,}60 \times 6{,}75 = 4{,}05\ \tfrac{\text{m}}{\text{s}}
+  \;=\; 14{,}6\ \tfrac{\text{km}}{\text{h}}
+\]
+
+Zusätzlich gilt: eine Sprint-Phase muss mindestens $2$ Sekunden andauern
+(Mindestdauer-Filter gegen GPS-Rauschen).
+
+% -------------------------------------------------------
+\section*{5. Segmentierung (Zustandswechsel)}
+
+Aus der binären Aktivierungsmaske $a(t) \in \{0,1\}$ werden Segmente gebildet:
+
+\[
+  \Delta(t) =
+  \begin{cases}
+    1 & \text{falls } a(t) \neq a(t-1) \\
+    0 & \text{sonst}
+  \end{cases}
+  \qquad
+  \text{segment\_id}(t) = \sum_{s=0}^{t} \Delta(s)
+\]
+
+% -------------------------------------------------------
+\section*{6. Speed-Normalisierung (Heatmap)}
+
+Für jeden Sprint wird die geglättete Geschwindigkeit auf $[0,\,1]$ normiert,
+um eine einheitliche Farbkodierung in der GPS-Karte zu ermöglichen
+(violett\,=\,langsam, gelb\,=\,schnell):
+
+\[
+  \tilde{v}(t) = \frac{\hat{v}(t) - \min(\hat{v})}{\max(\hat{v}) - \min(\hat{v}) + \varepsilon}
+  \qquad \varepsilon = 10^{-9}
+\]
+
+% -------------------------------------------------------
+\section*{7. Bewegungsrichtung (Quiver)}
+
+Die lokale Richtung ergibt sich aus den GPS-Differenzen aufeinanderfolgender Punkte:
+
+\[
+  \Delta\lambda(t) = \lambda(t) - \lambda(t-1)
+  \qquad
+  \Delta\varphi(t) = \varphi(t) - \varphi(t-1)
+\]
+
+wobei $\lambda$ die Länge und $\varphi$ die Breite bezeichnet. Der Richtungsvektor
+$(\Delta\lambda,\, \Delta\varphi)$ wird alle $n = 3$ Punkte als Pfeil gezeichnet.
+
+\end{document}
