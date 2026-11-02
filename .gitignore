@@ -9,6 +9,9 @@ data/
 *.fit
 *.html
 
+# Generierte Ausgaben (Karten, Plots)
+output/
+
 # OS
 .DS_Store
 
