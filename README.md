@@ -36,10 +36,12 @@ data/
 src/
   loader.py
   sprint_detector.py
+  replay.py
 docs/
   doku.md, doku.tex, doku.pdf
 output/
   maps/               generierte Sprint-Karten (sprint_map_<session>.html)
+  replay.html         interaktiver Session-Replay
 ```
 
 `data/` und `output/` sind per `.gitignore` von der Versionskontrolle ausgeschlossen.
@@ -49,6 +51,7 @@ output/
 | Datei | Beschreibung |
 |---|---|
 | `src/loader.py` | Lädt einzelne `.fit`-Dateien oder ganze Ordner, wandelt GPS-Semicircles in Grad um, bereinigt unrealistische Geschwindigkeitswerte, glättet den Speed-Verlauf (Rolling Mean) |
+| `src/replay.py` | Erzeugt den interaktiven Session-Replay `output/replay.html` (siehe unten) |
 | `src/sprint_detector.py` | Erkennt Sprint-Phasen anhand eines individuellen Schwellwerts (Anteil der persönlichen Maximalgeschwindigkeit), segmentiert zusammenhängende Sprints, liefert Statistiken, Plots, eine interaktive GPS-Karte und einen Session-übergreifenden Trend |
 | `docs/doku.md` | Ausführliche technische Dokumentation der Methodik (Formeln, Parameter, Beispiele) |
 | `docs/doku.pdf` | Mathematische Herleitungen als LaTeX-Dokument |
@@ -62,6 +65,37 @@ output/
 - **`plot_sprints`** – Speed-Verlauf mit Sprint-Phasen und echter Herzfrequenz (zweite Y-Achse)
 - **`plot_sprint_gps`** – interaktive Karte (Folium, Esri-Satellitenbild) mit farbcodierten Sprint-Routen; speichert eine `.html`-Datei und öffnet sie automatisch im Browser. Für das Hintergrundbild wird ein ArcGIS-API-Key benötigt (siehe unten). Ist `folium` nicht installiert, greift automatisch ein einfacher matplotlib-Fallback-Plot
 - **`session_trend_row` / `season_trend_summary` / `plot_season_trend`** – fasst mehrere Sessions zu einer Trend-Übersicht zusammen (Top-Speed, Sprintanzahl, Sprint-Distanz, Herzfrequenz über die Zeit)
+
+## Session-Replay (`src/replay.py`)
+
+Erzeugt eine interaktive Seite `output/replay.html`, auf der man eine Einheit wie ein Video abspielen kann:
+
+- Session auswählen, Intervall in der Timeline ziehen oder per Preset wählen (z.B. **„Letzte 60 min“** für die Gametime; bei Einheiten > 75 min ist das der Standard)
+- Abspielen mit 1×–60×, Spurlänge 10 s / 30 s / 2 min / alles; die Spur ist nach Geschwindigkeit eingefärbt, Läufe ≥ 60 % `v_max` sind dicker
+- Antritte erscheinen als Dreiecke auf dem Feld und in einer Liste – ein Klick springt 3 s vor die Szene
+- Live-Anzeige: Uhrzeit, Speed, Zone, Herzfrequenz, Beschleunigung sowie Distanz, Top-Speed, Antritte und Läufe im Intervall bis jetzt
+- **„Als Video speichern“** nimmt das gewählte Intervall im eingestellten Tempo als `.webm` auf (Chrome/Edge/Firefox)
+
+**Satellitenbild & Ausrichtung:** Unter dem Feld liegt ein Esri-Satellitenbild (Button „Satellit“ schaltet es aus), das zusammen mit den Laufwegen gedreht wird. Die Ausrichtung kommt **nicht** aus den Laufwegen, sondern ist pro Platz in `FIELDS` (oben in `replay.py`) hinterlegt – am Satellitenbild ausgemessen, Feld-Längsachse horizontal:
+
+| Platz | Längsachse |
+|---|---|
+| Monarchs-Platz (Training, FunBowl) | 91,2° (≈ Nord–Süd) |
+| Uni-Sportplatz (Uni-Kurs) | 113,0° |
+
+Prüfen lässt sich das mit **„Norden oben“** (Nordpfeil oben rechts). Mit ⟲/⟳ (Shift = 10°) und 90° kann man nachjustieren; die Einstellung wird pro Session im Browser gemerkt, „Reset“ stellt den hinterlegten Wert wieder her. Für einen neuen Platz den angezeigten Winkel in `FIELDS` eintragen – unbekannte Plätze werden mit Norden oben dargestellt.
+
+Ohne Key wird der öffentliche Esri-Kachel-Endpunkt verwendet. Ist `ARCGIS_API_KEY` gesetzt, wird stattdessen der Basemap-Dienst mit Key genutzt – der Key steht dann in `output/replay.html`, die Datei also nicht weitergeben. Ein Video mit „Als Video speichern“ enthält das Satellitenbild mit.
+
+`v_max` und damit die Farbskala werden immer über alle Sessions in `data/` bestimmt.
+
+```bash
+python src/replay.py                          # alle Sessions in data/
+python src/replay.py data/trainingMonarchs/   # nur ein Ordner
+python src/replay.py data/trainingMonarchs/26-10-29.fit
+```
+
+Bedienung: Timeline **ziehen** = Intervall wählen, **klicken** = springen, Leertaste = Play/Pause, ←/→ = ±5 s.
 
 ## Installation
 
