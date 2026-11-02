@@ -90,10 +90,12 @@ def detect_sprints(df: pd.DataFrame,
 
     2. Binäre Klassifikation pro Datenpunkt (1 Hz)
 
-    3. Mindestdauer-Filter: Bursts < min_duration_s werden entfernt
+    3. Mindestdauer-Filter: Bursts < min_duration_s (Summe der echten
+       Sample-Dauern dt_s) werden entfernt
        → [8] GPS-Rauschen bei hohen Speeds eliminieren
 
-    4. Sprint-IDs: zusammenhängende Phasen erhalten eine eindeutige ID
+    4. Sprint-IDs: zusammenhängende Phasen erhalten eine eindeutige ID.
+       Ein Sprint endet auch an einer Aufzeichnungslücke (segment_id).
        → Grundlage für spätere Play-Segmentierung
 
     Parameter
@@ -142,31 +144,33 @@ def detect_sprints(df: pd.DataFrame,
     # ----------------------------------------------------------
     # 3. Mindestdauer-Filter
     # ----------------------------------------------------------
-    df["_raw_sprint_id"] = (df["is_sprint"] != df["is_sprint"].shift()).cumsum()
+    def _blocks(d):
+        # Neuer Block bei Zustandswechsel ODER Beginn eines neuen
+        # Aufzeichnungsabschnitts (Lücke) → kein Sprint über Pausen hinweg
+        changed = (d["is_sprint"] != d["is_sprint"].shift()) | \
+                  (d["segment_id"] != d["segment_id"].shift())
+        return changed.cumsum()
 
-    for sid, group in df[df["is_sprint"]].groupby("_raw_sprint_id"):
-        if len(group) < min_duration_s:
-            df.loc[group.index, "is_sprint"] = False
-
-    df.drop(columns=["_raw_sprint_id"], inplace=True)
+    raw_blocks = _blocks(df)
+    sprint_dur = df.loc[df["is_sprint"], "dt_s"].groupby(raw_blocks[df["is_sprint"]]).sum()
+    too_short  = sprint_dur[sprint_dur < min_duration_s].index
+    df.loc[raw_blocks.isin(too_short) & df["is_sprint"], "is_sprint"] = False
 
     # ----------------------------------------------------------
     # 4. Sprint-IDs
     # ----------------------------------------------------------
+    blocks = _blocks(df)
     df["sprint_id"] = 0
-    state_change = (df["is_sprint"] != df["is_sprint"].shift()).cumsum()
-    sprint_counter = 0
-
-    for sid, group in df[df["is_sprint"]].groupby(state_change[df["is_sprint"]]):
-        sprint_counter += 1
-        df.loc[group.index, "sprint_id"] = sprint_counter
+    sprint_blocks = blocks[df["is_sprint"]]
+    ids = {b: i + 1 for i, b in enumerate(pd.unique(sprint_blocks))}
+    df.loc[df["is_sprint"], "sprint_id"] = sprint_blocks.map(ids).astype(int)
 
     # ----------------------------------------------------------
     # 5. Logging
     # ----------------------------------------------------------
     n_sprints     = df["sprint_id"].max()
-    total_time    = df["is_sprint"].sum()
-    pct_time      = round(df["is_sprint"].mean() * 100, 1)
+    total_time    = round(df.loc[df["is_sprint"], "dt_s"].sum(), 1)
+    pct_time      = round(total_time / df["dt_s"].sum() * 100, 1)
     threshold_kmh = round(threshold * 3.6, 1)
 
     print(f"  Sprint-Schwelle:    {threshold:.2f} m/s  ({threshold_kmh} km/h)"
@@ -184,21 +188,29 @@ def detect_sprints(df: pd.DataFrame,
 def sprint_summary(df: pd.DataFrame) -> pd.DataFrame:
     """
     Berechnet Kennzahlen pro Sprint-Phase.
+
+    Alle zeitabhängigen Größen nutzen die echte Sample-Dauer dt_s,
+    funktionieren also auch bei Abtastraten != 1 Hz:
+        duration_s = Σ dt_s
+        distance_m = Σ v · dt_s
+        accel      = Δv / Δt   (m/s²)
     """
     sprints = df[df["is_sprint"] & (df["sprint_id"] > 0)]
 
     rows = []
     for sid, group in sprints.groupby("sprint_id"):
         group = group.copy()
-        accel = group["speed_smooth"].diff().fillna(0)
+        # Sprints liegen immer innerhalb eines lückenlosen Abschnitts,
+        # daher ist dt_s hier der echte Abstand zum Vorpunkt
+        accel = (group["speed_smooth"].diff() / group["dt_s"]).fillna(0)
 
         rows.append({
             "sprint_id":      sid,
-            "duration_s":     len(group),
+            "duration_s":     round(group["dt_s"].sum(), 1),
             "speed_max_ms":   round(group["speed_smooth"].max(), 2),
             "speed_max_kmh":  round(group["speed_smooth"].max() * 3.6, 1),
             "speed_mean_ms":  round(group["speed_smooth"].mean(), 2),
-            "distance_m":     round(group["speed_smooth"].sum(), 1),
+            "distance_m":     round((group["speed_smooth"] * group["dt_s"]).sum(), 1),
             "accel_peak":     round(accel.max(), 2),
             "time_start":     group["timestamp"].iloc[0],
             "time_end":       group["timestamp"].iloc[-1],
@@ -216,11 +228,11 @@ def zone_distribution(df: pd.DataFrame) -> pd.DataFrame:
     Gibt die prozentuale Verteilung der Geschwindigkeitszonen zurück.
     """
     zone_order = ["walking", "jogging", "running", "high_speed", "sprint", "unknown"]
-    counts = df["speed_zone"].value_counts()
+    counts = df.groupby("speed_zone")["dt_s"].sum()
 
     result = pd.DataFrame({
         "zone":    zone_order,
-        "seconds": [counts.get(z, 0) for z in zone_order],
+        "seconds": [round(counts.get(z, 0.0), 1) for z in zone_order],
     })
     result["percent"] = (result["seconds"] / result["seconds"].sum() * 100).round(1)
     return result[result["seconds"] > 0].reset_index(drop=True)
@@ -245,9 +257,9 @@ def session_trend_row(df: pd.DataFrame) -> dict:
     return {
         "source_file":       df["source_file"].iloc[0],
         "date":              df["timestamp"].iloc[0].date(),
-        "duration_min":      round((df["timestamp"].max() - df["timestamp"].min()).total_seconds() / 60, 1),
+        "duration_min":      round(df["dt_s"].sum() / 60, 1),
         "n_sprints":         int(len(stats)),
-        "sprint_time_s":     int(df["is_sprint"].sum()),
+        "sprint_time_s":     round(df.loc[df["is_sprint"], "dt_s"].sum(), 1),
         "speed_max_kmh":     round(stats["speed_max_kmh"].max(), 1) if not stats.empty else 0.0,
         "sprint_distance_m": round(stats["distance_m"].sum(), 1) if not stats.empty else 0.0,
         "hr_mean_bpm":       round(df["heart_rate"].mean(), 1) if df["heart_rate"].notna().any() else None,
@@ -458,13 +470,25 @@ def plot_sprint_gps(df: pd.DataFrame,
         tiles=None
     )
 
-    # OpenStreetMap-Kacheln (max_zoom=25 für sehr hohe Auflösung auf Spielfeld)
-    folium.TileLayer(
-        tiles="OpenStreetMap",
-        max_zoom=25,
-        max_native_zoom=19,
-        name="OSM"
-    ).add_to(m)
+    # ----------------------------------------------------------
+    # Hintergrundkarten
+    # ----------------------------------------------------------
+    # OSM-Kacheln werden bei lokal geöffneten HTML-Dateien (file://)
+    # blockiert (kein Referer). Daher: Esri-Satellitenbild über einen
+    # ArcGIS-API-Key aus der Umgebungsvariable ARCGIS_API_KEY.
+    api_key = os.environ.get("ARCGIS_API_KEY")
+
+    if api_key:
+        folium.TileLayer(
+            tiles=("https://ibasemaps-api.arcgis.com/arcgis/rest/services/"
+                   "World_Imagery/MapServer/tile/{z}/{y}/{x}?token=" + api_key),
+            attr="Tiles © Esri — Source: Esri, Maxar, Earthstar Geographics",
+            name="Satellit",
+            max_zoom=25,
+            max_native_zoom=19,
+        ).add_to(m)
+    else:
+        print("  Hinweis: ARCGIS_API_KEY nicht gesetzt – Karte ohne Hintergrundbild.")
 
     # ----------------------------------------------------------
     # Gesamte Route grau im Hintergrund
@@ -619,6 +643,11 @@ if __name__ == "__main__":
     df_all = load_multiple(files, verbose=False)
     v_max  = personal_max_speed(df_all)
 
+    # Karten landen gesammelt in <projekt>/output/maps/ statt im Arbeitsverzeichnis
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    map_dir      = os.path.join(project_root, "output", "maps")
+    os.makedirs(map_dir, exist_ok=True)
+
     trend_rows = []
 
     for f in files:
@@ -646,7 +675,7 @@ if __name__ == "__main__":
         plot_sprints(df, title=f"Sprint Detection – {os.path.basename(f)}")
         plot_sprint_gps(df,
                         title=f"Sprint-Routen – {os.path.basename(f)}",
-                        output_file=f"sprint_map_{session_name}.html")
+                        output_file=os.path.join(map_dir, f"sprint_map_{session_name}.html"))
 
     # Season-Trend nur sinnvoll bei mehreren Sessions
     if len(files) > 1:

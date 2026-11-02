@@ -39,6 +39,12 @@ SMOOTH_WINDOW = 3
 # zum Vorpunkt werden als Ausreißer markiert (ca. 50 km/h Sprung = Fehler)
 MAX_SPEED_MS = 12.0   # m/s ≈ 43 km/h – realistisches Max für Amateure
 
+# Abtastintervall: Garmin zeichnet bei "Jede Sekunde" mit 1 Hz auf, bei
+# "Smart Recording" oder pausierter Uhr entstehen aber größere Abstände.
+# Abstände > MAX_GAP_S gelten als Aufzeichnungslücke: dort wird nicht
+# geglättet/interpoliert und kein Sprint darf über die Lücke hinweg laufen.
+MAX_GAP_S = 2.0
+
 
 # ============================================================
 # HAUPT-LADEFUNKTION
@@ -62,8 +68,12 @@ def load_fit(filepath: str,
     Rückgabe
     --------
     pd.DataFrame mit Spalten:
-        timestamp, lat, lon, speed_raw, speed_smooth,
-        heart_rate, distance, gps_valid, source_file
+        timestamp, dt_s, segment_id, lat, lon, gps_valid,
+        speed_raw, speed_smooth, heart_rate, distance, source_file
+
+        dt_s       – effektive Dauer des Samples in Sekunden (Abstand zum
+                     Vorpunkt; an Lücken und am Anfang = typisches Intervall)
+        segment_id – Nummer des lückenlosen Aufzeichnungsabschnitts
     """
 
     # ----------------------------------------------------------
@@ -91,6 +101,31 @@ def load_fit(filepath: str,
     t_start = df["timestamp"].min() + pd.Timedelta(minutes=trim_start_min)
     t_end   = df["timestamp"].max() - pd.Timedelta(minutes=trim_end_min)
     df = df[(df["timestamp"] >= t_start) & (df["timestamp"] <= t_end)].copy()
+
+    # Doppelte Zeitstempel entfernen (dt = 0 würde Division durch 0 erzeugen)
+    df = df.drop_duplicates(subset="timestamp", keep="first").reset_index(drop=True)
+
+    # ----------------------------------------------------------
+    # 2b. Abtastintervall prüfen & Aufzeichnungslücken erkennen
+    # ----------------------------------------------------------
+    dt_raw = df["timestamp"].diff().dt.total_seconds()
+    nominal_dt = float(dt_raw.median()) if dt_raw.notna().any() else 1.0
+
+    is_gap = dt_raw > MAX_GAP_S
+    df["segment_id"] = is_gap.cumsum().astype(int)
+
+    # Effektive Sample-Dauer: an Lücken und am ersten Punkt das typische
+    # Intervall, sonst der echte Abstand zum Vorpunkt
+    df["dt_s"] = dt_raw.where(~is_gap & dt_raw.notna(), nominal_dt)
+
+    n_gaps = int(is_gap.sum())
+    if n_gaps or abs(nominal_dt - 1.0) > 1e-6:
+        gap_info = ", ".join(f"{g:.0f}s" for g in dt_raw[is_gap])
+        warnings.warn(
+            f"{os.path.basename(filepath)}: typisches Intervall {nominal_dt:g}s, "
+            f"{n_gaps} Aufzeichnungslücke(n) > {MAX_GAP_S:g}s"
+            + (f" ({gap_info})" if n_gaps else "")
+        )
 
     # ----------------------------------------------------------
     # 3. GPS-Koordinaten
@@ -122,13 +157,18 @@ def load_fit(filepath: str,
 
     # Physikalisch unrealistische Werte als NaN markieren
     df.loc[df["speed_raw"] > MAX_SPEED_MS, "speed_raw"] = np.nan
-    df["speed_raw"] = df["speed_raw"].interpolate(method="linear").fillna(0.0)
+    # Interpolation und Glättung je lückenlosem Abschnitt, damit nicht
+    # über eine Aufzeichnungspause hinweg gemittelt wird
+    seg = df.groupby("segment_id", sort=False)["speed_raw"]
+    df["speed_raw"] = seg.transform(
+        lambda s: s.interpolate(method="linear", limit_direction="both")
+    ).fillna(0.0)
 
     # Glättung (rolling mean, zentriert)
     df["speed_smooth"] = (
-        df["speed_raw"]
-        .rolling(window=SMOOTH_WINDOW, center=True, min_periods=1)
-        .mean()
+        df.groupby("segment_id", sort=False)["speed_raw"]
+        .transform(lambda s: s.rolling(window=SMOOTH_WINDOW, center=True,
+                                       min_periods=1).mean())
     )
 
     # ----------------------------------------------------------
@@ -156,7 +196,7 @@ def load_fit(filepath: str,
     # 8. Nur relevante Spalten zurückgeben
     # ----------------------------------------------------------
     keep = [
-        "timestamp", "lat", "lon", "gps_valid",
+        "timestamp", "dt_s", "segment_id", "lat", "lon", "gps_valid",
         "speed_raw", "speed_smooth",
         "heart_rate", "distance",
         "source_file"
@@ -232,13 +272,14 @@ def session_summary(df: pd.DataFrame) -> dict:
     Gibt eine kompakte Übersicht einer geladenen Session zurück.
     Nützlich um alle Trainings schnell zu verstehen (Schritt 1).
     """
-    duration = (df["timestamp"].max() - df["timestamp"].min()).total_seconds() / 60
+    duration = df["dt_s"].sum() / 60   # aufgezeichnete Zeit ohne Pausen
 
     return {
         "source_file":    df["source_file"].iloc[0],
         "date":           df["timestamp"].iloc[0].date(),
         "duration_min":   round(duration, 1),
         "n_points":       len(df),
+        "n_gaps":         int(df["segment_id"].max()),
         "gps_coverage_%": round(df["gps_valid"].mean() * 100, 1),
         "speed_max_ms":   round(df["speed_raw"].max(), 2),
         "speed_max_kmh":  round(df["speed_raw"].max() * 3.6, 1),
