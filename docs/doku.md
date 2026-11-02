@@ -7,7 +7,7 @@ Die Pipeline besteht aktuell aus zwei Modulen. Die Spielzug-Segmentierung und ei
 | Modul | Datei | Zweck |
 |---|---|---|
 | Datenlader | `src/loader.py` | FIT-Datei einlesen, GPS konvertieren, Speed bereinigen und glätten, persönliche v_max bestimmen |
-| Sprint-Erkennung | `src/sprint_detector.py` | Geschwindigkeitszonen, Sprint-Detektion, Kennzahlen, Visualisierung, Season-Trend |
+| Sprint- & Antritt-Erkennung | `src/sprint_detector.py` | Geschwindigkeitszonen, Lauf-Detektion (Speed), Antritt-Detektion (Beschleunigung), Kennzahlen, Visualisierung, Season-Trend |
 | Spielzug-Segmentierung | `src/play_segment.py` | *geplant* |
 
 ---
@@ -136,31 +136,30 @@ Beim Aufruf über die Kommandozeile wird `v_max` über alle Dateien des übergeb
 
 ### 4.1 Geschwindigkeitszonen
 
-Jeder Datenpunkt wird anhand von `speed_smooth` einer Zone relativ zu `v_max` zugeordnet (`ZONE_BOUNDARIES_PCT`):
+Jeder Datenpunkt wird anhand von `speed_smooth` einer Zone relativ zu `v_max` zugeordnet (`ZONE_BOUNDARIES_PCT`). Im Fußball liegen die Grenzen üblicherweise bei ca. 70 % (High Speed) und 85 % (Sprint). Für Flag Football mit kurzen Distanzen, bei denen die volle Maximalgeschwindigkeit selten erreicht wird, sind sie nach unten verschoben:
 
 | Zone | Bereich (Anteil von v_max) |
 |---|---|
 | walking | 0 – 30 % |
-| jogging | 30 – 50 % |
-| running | 50 – 70 % |
-| high_speed | 70 – 85 % |
-| sprint | ≥ 85 % |
+| jogging | 30 – 45 % |
+| running | 45 – 60 % |
+| high_speed | 60 – 80 % |
+| sprint | ≥ 80 % |
 
 Werte ≥ v_max werden ebenfalls als `sprint` eingestuft; fehlende Werte als `unknown`.
 
-### 4.2 Sprint-Schwelle
+### 4.2 Detektionsschwelle
 
-Unabhängig von den Zonen wird eine eigene Sprint-Schwelle für die Detektion verwendet:
+Die Detektion nutzt direkt die Zonengrenzen, es gibt also nur eine Definition:
 
 ```
-threshold = SPRINT_ZONE_PCT × v_max      (SPRINT_ZONE_PCT = 0.6)
+SPRINT_ZONE_PCT = Beginn Zone high_speed = 0.60
+SPRINT_PEAK_PCT = Beginn Zone sprint     = 0.80
 
-is_sprint[t] = speed_smooth[t] ≥ threshold
+is_sprint[t] = speed_smooth[t] ≥ SPRINT_ZONE_PCT × v_max
 ```
 
-Die Schwelle ist für Flag Football bewusst niedriger als im Fußball angesetzt, da die Spielzüge kurz sind und selten die volle Maximalgeschwindigkeit erreicht wird.
-
-> **Hinweis:** Die Sprint-Detektion (≥ 60 %) und die Zone `sprint` (≥ 85 %) sind zwei verschiedene Definitionen. Detektierte Sprints können daher auch in den Zonen `running` und `high_speed` liegen.
+Erkannt wird damit jeder Lauf ab der Zone `high_speed`. Erreicht ein Lauf die Zone `sprint`, wird er als `category = "sprint"` eingestuft, sonst als `"high_speed"`. Beide Schwellen werden aus `ZONE_BOUNDARIES_PCT` abgeleitet; geändert werden sie über die Zonen.
 
 ### 4.3 Mindestdauer-Filter
 
@@ -185,6 +184,28 @@ Nach dem Filter werden die verbleibenden Sprint-Blöcke fortlaufend nummeriert:
 
 Diese IDs sind die Grundlage für die geplante Spielzug-Segmentierung.
 
+### 4.5 Antritt-Erkennung (`detect_accelerations`)
+
+**Motivation:** Viele Aktionen im Flag Football sind kurze, explosive Antritte über 5–15 m, bei denen die Speed-Schwelle nie erreicht wird. Außerdem liegt die Beschleunigungsphase zeitlich *vor* dem Überschreiten der Speed-Schwelle und wird von der Lauf-Detektion deshalb nicht erfasst. Antritte werden daher als eigener Kanal über die Beschleunigung erkannt.
+
+**Beschleunigung:**
+
+```
+a[t] = (speed_raw[t] − speed_raw[t−1]) / dt_s[t]      [m/s²]
+```
+
+Berechnet wird aus `speed_raw` und nicht aus `speed_smooth`. Garmins `enhanced_speed` ist bereits intern gefiltert; die zusätzliche Glättung würde die Spitzen etwa halbieren. Am Beginn jedes Aufzeichnungsabschnitts wird `a = 0` gesetzt, damit keine Geschwindigkeitsdifferenz über eine Lücke hinweg entsteht.
+
+**Detektion:**
+
+```
+is_accel[t] = a[t] ≥ ACCEL_MODERATE_MS2        (2.0 m/s²)
+```
+
+Zusammenhängende Samples innerhalb eines Abschnitts bilden einen Antritt mit eigener `accel_id` (0 = kein Antritt). Ein Mindestdauer-Filter wird nicht angewendet, da ein Antritt bei 1 Hz oft nur 1–2 Samples umfasst. Unrealistische Geschwindigkeiten sind bereits im Loader entfernt.
+
+**Kategorie:** `high`, wenn die Peak-Beschleunigung ≥ `ACCEL_HIGH_MS2` (3.0 m/s²), sonst `moderate`. Die Schwellen von 2 bzw. 3 m/s² entsprechen üblichen Grenzen im Teamsport und sind als Startwerte zu verstehen, die per Videoabgleich zu validieren sind.
+
 ---
 
 ## 5. Kennzahlen
@@ -197,16 +218,30 @@ Diese IDs sind die Grundlage für die geplante Spielzug-Segmentierung.
 | `speed_max_ms` / `speed_max_kmh` | Maximum von `speed_smooth` |
 | `speed_mean_ms` | Mittelwert von `speed_smooth` |
 | `distance_m` | Σ `speed_smooth` × `dt_s` |
-| `accel_peak` | Maximum von Δ`speed_smooth` / `dt_s` (m/s²) |
+| `accel_peak` | Maximum von Δ`speed_smooth` / `dt_s` (m/s²) innerhalb des Laufs |
+| `category` | `sprint` (Zone ≥ 80 % erreicht) oder `high_speed` |
 | `time_start` / `time_end` | erster bzw. letzter Zeitstempel |
 
-### 5.2 Zonenverteilung (`zone_distribution`)
+### 5.2 Pro Antritt (`accel_summary`)
+
+Ein Antritt beginnt am Sample *vor* der ersten Überschreitung (dort startet die Beschleunigung) und endet am letzten Sample über der Schwelle.
+
+| Kennzahl | Berechnung |
+|---|---|
+| `duration_s` | Σ `dt_s` der Samples über der Schwelle |
+| `v_start_kmh` / `v_end_kmh` | `speed_raw` am Start bzw. Ende |
+| `delta_v_kmh` | v_end − v_start |
+| `accel_peak` / `accel_mean` | Maximum bzw. Mittelwert von `a` |
+| `category` | `high` (≥ 3 m/s²) oder `moderate` |
+| `time_start` / `time_end` | Zeitstempel am Start bzw. Ende |
+
+### 5.3 Zonenverteilung (`zone_distribution`)
 
 Zeit (Σ `dt_s`) und prozentualer Zeitanteil je Geschwindigkeitszone innerhalb einer Session.
 
-### 5.3 Season-Trend (`session_trend_row`, `season_trend_summary`)
+### 5.4 Season-Trend (`session_trend_row`, `season_trend_summary`)
 
-Jede Session wird zu einer Zeile zusammengefasst: Datum, Dauer (aufgezeichnete Zeit Σ `dt_s`, ohne Pausen), Anzahl Sprints, Sprint-Zeit, Top-Speed, Sprint-Distanz gesamt, Ø und max. Herzfrequenz. `season_trend_summary` sortiert diese Zeilen nach Datum. Ein Trend wird erst ab zwei Sessions berechnet.
+Jede Session wird zu einer Zeile zusammengefasst: Datum, Dauer (aufgezeichnete Zeit Σ `dt_s`, ohne Pausen), Anzahl Sprints, Sprint-Zeit, Top-Speed, Sprint-Distanz gesamt, Ø und max. Herzfrequenz sowie – falls `detect_accelerations` gelaufen ist – Anzahl Läufe in der Sprint-Zone (`n_sprints_80`), Anzahl Antritte (`n_accel`), davon hoch (`n_accel_high`) und die höchste Beschleunigung (`accel_peak_max`). `season_trend_summary` sortiert diese Zeilen nach Datum. Ein Trend wird erst ab zwei Sessions berechnet.
 
 ---
 
@@ -216,7 +251,7 @@ Jede Session wird zu einer Zeile zusammengefasst: Datum, Dauer (aufgezeichnete Z
 
 Zwei Panels mit gemeinsamer Zeitachse:
 
-- **oben:** `speed_raw` (hell) und `speed_smooth` (dunkel), Sprint-Phasen rot hinterlegt
+- **oben:** `speed_raw` (hell) und `speed_smooth` (dunkel), Läufe ≥ 60 % v_max rot hinterlegt, Antritte als Dreiecke am Ende der Beschleunigungsphase (groß/dunkel = hoch)
 - **unten:** Geschwindigkeitszonen als farbiger Hintergrund, Sprint-Phasen markiert, echte Herzfrequenz in bpm auf zweiter Y-Achse
 
 ### 6.2 Interaktive Sprint-Karte (`plot_sprint_gps`)
@@ -243,7 +278,7 @@ Die Karten werden unter `output/maps/sprint_map_<session>.html` gespeichert und 
 
 ### 6.3 Season-Trend (`plot_season_trend`)
 
-Vier Panels mit jeweils eigener Achse: Top-Speed (km/h), Anzahl Sprints, Sprint-Distanz gesamt (m) sowie Ø und max. Herzfrequenz (bpm). Der jeweils höchste Wert wird beschriftet.
+Vier Panels mit jeweils eigener Achse: Top-Speed (km/h), Anzahl Läufe ≥ 60 % und Anzahl Antritte, Sprint-Distanz gesamt (m) sowie Ø und max. Herzfrequenz (bpm). Der jeweils höchste Wert wird beschriftet.
 
 ---
 
@@ -256,8 +291,11 @@ Vier Panels mit jeweils eigener Achse: Top-Speed (km/h), Anzahl Sprints, Sprint-
 | `MAX_GAP_S` | `loader.py` | 2.0 s | Abstand, ab dem eine Aufzeichnungslücke vorliegt |
 | `trim_start_min` | `loader.py` | 0.0 | Minuten am Anfang abschneiden |
 | `trim_end_min` | `loader.py` | 0.0 | Minuten am Ende abschneiden |
-| `ZONE_BOUNDARIES_PCT` | `sprint_detector.py` | 30/50/70/85 % | Zonengrenzen relativ zu v_max |
-| `SPRINT_ZONE_PCT` | `sprint_detector.py` | 0.6 | Sprint-Schwelle relativ zu v_max |
+| `ZONE_BOUNDARIES_PCT` | `sprint_detector.py` | 30/45/60/80 % | Zonengrenzen relativ zu v_max |
+| `SPRINT_ZONE_PCT` | `sprint_detector.py` | 0.6 (abgeleitet) | Detektionsschwelle = Beginn high_speed |
+| `SPRINT_PEAK_PCT` | `sprint_detector.py` | 0.8 (abgeleitet) | Kategorie „sprint“ = Beginn Zone sprint |
+| `ACCEL_MODERATE_MS2` | `sprint_detector.py` | 2.0 m/s² | Antritt-Schwelle |
+| `ACCEL_HIGH_MS2` | `sprint_detector.py` | 3.0 m/s² | Kategorie „high“ |
 | `MIN_SPRINT_DURATION_S` | `sprint_detector.py` | 2 | Mindestdauer eines Sprints in Sekunden |
 | `top_n` | `plot_sprint_gps` | 10 | Anzahl hervorgehobener Sprints auf der Karte |
 | `ARCGIS_API_KEY` | Umgebungsvariable | – | API-Key für den Kartenhintergrund |
@@ -276,8 +314,10 @@ personal_max_speed()   → v_max = 99,99. Perzentil von speed_raw
 load_fit()             → DataFrame je Session (timestamp, dt_s, segment_id, lat, lon, speed_raw, speed_smooth, heart_rate, …)
    ↓
 detect_sprints()       → speed_zone, is_sprint (≥ 60 % v_max, ≥ 2 s), sprint_id
+detect_accelerations() → accel, is_accel (≥ 2 m/s²), accel_id
    ↓
-sprint_summary()       → Kennzahlen pro Sprint
+sprint_summary()       → Kennzahlen pro Lauf (inkl. Kategorie)
+accel_summary()        → Kennzahlen pro Antritt
 zone_distribution()    → Zeitanteile je Zone
    ↓
 plot_sprints()         → Speed-Verlauf + Zonen + Herzfrequenz

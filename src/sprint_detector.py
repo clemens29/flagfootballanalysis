@@ -10,7 +10,9 @@ Verwendung:
 
     df      = load_fit("mein_training.fit")
     df      = detect_sprints(df, v_max=7.0)
+    df      = detect_accelerations(df)
     summary = sprint_summary(df)
+    antritte = accel_summary(df)
 
 Wissenschaftliche Grundlagen:
     [7]  Science for Sport – GPS Metrics & Application
@@ -47,29 +49,51 @@ import matplotlib.ticker as ticker
 # absoluten Werten (z.B. "18 km/h = Sprint"), da diese zwischen
 # Sportlern und Sportarten stark variieren.
 #
-# Übliche Zoneneinteilung relativ zu v_max:
+# Im Fußball übliche Zonen liegen bei High Speed ab ~70% und
+# Sprint ab ~85% v_max. Für Flag Football (explosive Starts, kurze
+# Distanzen, selten volle Maximalgeschwindigkeit) sind die Grenzen
+# nach unten verschoben:
 #   Walking:     0  – 30% v_max
-#   Jogging:    30  – 50% v_max
-#   Running:    50  – 70% v_max
-#   High Speed: 70  – 85% v_max
-#   Sprint:     > 85% v_max
+#   Jogging:    30  – 45% v_max
+#   Running:    45  – 60% v_max
+#   High Speed: 60  – 80% v_max
+#   Sprint:     ≥ 80% v_max
 #
-# Für Flag Football (explosive Starts, kurze Distanzen) wurde
-# die Sprint-Schwelle auf 60% gesetzt – etwas niedriger als im
-# Fußball, da die Spielzüge kürzer sind und selten volle
-# Maximalgeschwindigkeit erreicht wird. Dieser Wert ist anpassbar.
+# Die Lauf-Detektion (detect_sprints) nutzt GENAU diese Grenzen:
+# erkannt wird jede Phase ab High Speed (≥ 60%); erreicht sie die
+# Sprint-Zone (≥ 80%), wird sie als "sprint" kategorisiert, sonst
+# als "high_speed". Es gibt damit nur noch eine Definition.
 
 ZONE_BOUNDARIES_PCT = {
     "walking":    (0.00, 0.30),
-    "jogging":    (0.30, 0.50),
-    "running":    (0.50, 0.70),
-    "high_speed": (0.70, 0.85),
-    "sprint":     (0.85, 1.00),
+    "jogging":    (0.30, 0.45),
+    "running":    (0.45, 0.60),
+    "high_speed": (0.60, 0.80),
+    "sprint":     (0.80, 1.00),
 }
 
-SPRINT_ZONE_PCT = 0.6   # Schwelle für Flag Football (anpassbar)
+# Abgeleitet aus den Zonen – nicht separat ändern, sondern die Zonen anpassen
+SPRINT_ZONE_PCT = ZONE_BOUNDARIES_PCT["high_speed"][0]   # Detektionsschwelle (60%)
+SPRINT_PEAK_PCT = ZONE_BOUNDARIES_PCT["sprint"][0]       # Kategorie "sprint" (80%)
 
 MIN_SPRINT_DURATION_S = 2
+
+
+# ============================================================
+# ANTRITT-DEFINITION (BESCHLEUNIGUNG)
+# ============================================================
+#
+# Im Flag Football sind viele Aktionen kurze, explosive Antritte über
+# 5–15 m, bei denen die Speed-Schwelle nie erreicht wird. Diese werden
+# über die Beschleunigung a = Δv / Δt erkannt.
+#
+# Übliche Schwellen im Teamsport: > 2 m/s² (moderat), > 3 m/s² (hoch).
+# Berechnet wird aus speed_raw (Garmins enhanced_speed ist bereits
+# intern gefiltert) – die zusätzliche Glättung würde die Spitzen etwa
+# halbieren. Die Werte sind Startwerte und per Video zu validieren.
+
+ACCEL_MODERATE_MS2 = 2.0   # Antritt-Schwelle
+ACCEL_HIGH_MS2     = 3.0   # Kategorie "high"
 
 
 # ============================================================
@@ -106,7 +130,8 @@ def detect_sprints(df: pd.DataFrame,
         Persönliche Maximalgeschwindigkeit in m/s.
         Berechnen mit loader.personal_max_speed()
     sprint_pct : float
-        Anteil von v_max als Sprint-Schwelle (default: 0.60)
+        Anteil von v_max als Detektionsschwelle
+        (default: Beginn der Zone high_speed = 0.60)
     min_duration_s : int
         Minimale Sprint-Dauer in Sekunden (default: 2)
 
@@ -212,11 +237,118 @@ def sprint_summary(df: pd.DataFrame) -> pd.DataFrame:
             "speed_mean_ms":  round(group["speed_smooth"].mean(), 2),
             "distance_m":     round((group["speed_smooth"] * group["dt_s"]).sum(), 1),
             "accel_peak":     round(accel.max(), 2),
+            # Kategorie nach erreichter Zone (siehe ZONE_BOUNDARIES_PCT)
+            "category":       "sprint" if (group["speed_zone"] == "sprint").any()
+                              else "high_speed",
             "time_start":     group["timestamp"].iloc[0],
             "time_end":       group["timestamp"].iloc[-1],
         })
 
     return pd.DataFrame(rows)
+
+
+# ============================================================
+# ANTRITT-DETEKTION (BESCHLEUNIGUNG)
+# ============================================================
+
+def detect_accelerations(df: pd.DataFrame,
+                         accel_threshold: float = ACCEL_MODERATE_MS2,
+                         verbose: bool = True) -> pd.DataFrame:
+    """
+    Erkennt Antritte (explosive Beschleunigungen) unabhängig von der
+    erreichten Geschwindigkeit.
+
+    Methode
+    -------
+    1. a[t] = (v_raw[t] − v_raw[t−1]) / dt_s[t]   (m/s²)
+       – aus speed_raw, nicht speed_smooth (Spitzen bleiben erhalten)
+       – am Beginn jedes Aufzeichnungsabschnitts a = 0 (keine Δv über Lücken)
+    2. is_accel[t] = a[t] ≥ accel_threshold
+    3. Zusammenhängende Samples (innerhalb eines Abschnitts) bilden
+       einen Antritt mit eindeutiger accel_id (0 = kein Antritt)
+
+    Kein Mindestdauer-Filter: bei 1 Hz dauert ein Antritt oft nur 1–2
+    Samples. Ausreißer > MAX_SPEED_MS sind bereits im Loader entfernt.
+
+    Rückgabe
+    --------
+    df mit zusätzlichen Spalten:
+        accel     – Beschleunigung in m/s²
+        is_accel  – bool
+        accel_id  – int, eindeutige ID pro Antritt (0 = kein Antritt)
+    """
+    df = df.copy()
+
+    new_segment = df["segment_id"] != df["segment_id"].shift()
+    accel = df["speed_raw"].diff() / df["dt_s"]
+    accel[new_segment] = 0.0
+    df["accel"] = accel.fillna(0.0)
+
+    df["is_accel"] = df["accel"] >= accel_threshold
+
+    changed = (df["is_accel"] != df["is_accel"].shift()) | new_segment
+    blocks  = changed.cumsum()
+    acc_blocks = blocks[df["is_accel"]]
+    ids = {b: i + 1 for i, b in enumerate(pd.unique(acc_blocks))}
+    df["accel_id"] = 0
+    df.loc[df["is_accel"], "accel_id"] = acc_blocks.map(ids).astype(int)
+
+    if verbose:
+        summ = accel_summary(df)
+        n_high = int((summ["category"] == "high").sum()) if not summ.empty else 0
+        print(f"  Antritt-Schwelle:   {accel_threshold:.1f} m/s²"
+              f"  (hoch ≥ {ACCEL_HIGH_MS2:.1f} m/s²)")
+        print(f"  Antritte gefunden:  {len(summ)}  (davon hoch: {n_high})")
+
+    return df
+
+
+def accel_summary(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Kennzahlen pro Antritt.
+
+    Ein Antritt beginnt am Sample VOR der ersten Überschreitung (dort
+    startet die Beschleunigung) und endet am letzten Sample über der
+    Schwelle.
+
+        v_start_kmh  – Geschwindigkeit beim Start
+        v_end_kmh    – Geschwindigkeit am Ende der Beschleunigung
+        delta_v_kmh  – Geschwindigkeitsgewinn
+        accel_peak   – maximale Beschleunigung (m/s²)
+        accel_mean   – mittlere Beschleunigung (m/s²)
+        duration_s   – Dauer der Beschleunigungsphase (Σ dt_s)
+        category     – "high" (Peak ≥ ACCEL_HIGH_MS2) oder "moderate"
+    """
+    cols = ["accel_id", "duration_s", "v_start_kmh", "v_end_kmh",
+            "delta_v_kmh", "accel_peak", "accel_mean", "category",
+            "time_start", "time_end"]
+    if "accel_id" not in df.columns or df["accel_id"].max() == 0:
+        return pd.DataFrame(columns=cols)
+
+    rows = []
+    for aid, group in df[df["accel_id"] > 0].groupby("accel_id"):
+        i_first, i_last = group.index[0], group.index[-1]
+        # Startpunkt = Sample davor (innerhalb desselben Abschnitts)
+        i_start = i_first - 1 if (i_first - 1 in df.index and
+                  df.at[i_first - 1, "segment_id"] == df.at[i_first, "segment_id"]) else i_first
+        v_start = df.at[i_start, "speed_raw"]
+        v_end   = df.at[i_last, "speed_raw"]
+        peak    = group["accel"].max()
+
+        rows.append({
+            "accel_id":    aid,
+            "duration_s":  round(group["dt_s"].sum(), 1),
+            "v_start_kmh": round(v_start * 3.6, 1),
+            "v_end_kmh":   round(v_end * 3.6, 1),
+            "delta_v_kmh": round((v_end - v_start) * 3.6, 1),
+            "accel_peak":  round(peak, 2),
+            "accel_mean":  round(group["accel"].mean(), 2),
+            "category":    "high" if peak >= ACCEL_HIGH_MS2 else "moderate",
+            "time_start":  df.at[i_start, "timestamp"],
+            "time_end":    df.at[i_last, "timestamp"],
+        })
+
+    return pd.DataFrame(rows, columns=cols)
 
 
 # ============================================================
@@ -253,6 +385,7 @@ def session_trend_row(df: pd.DataFrame) -> dict:
     zu einer Zeile für die Season-Trend-Übersicht zusammen.
     """
     stats = sprint_summary(df)
+    acc   = accel_summary(df) if "accel_id" in df.columns else pd.DataFrame()
 
     return {
         "source_file":       df["source_file"].iloc[0],
@@ -262,6 +395,10 @@ def session_trend_row(df: pd.DataFrame) -> dict:
         "sprint_time_s":     round(df.loc[df["is_sprint"], "dt_s"].sum(), 1),
         "speed_max_kmh":     round(stats["speed_max_kmh"].max(), 1) if not stats.empty else 0.0,
         "sprint_distance_m": round(stats["distance_m"].sum(), 1) if not stats.empty else 0.0,
+        "n_sprints_80":      int((stats["category"] == "sprint").sum()) if not stats.empty else 0,
+        "n_accel":           int(len(acc)),
+        "n_accel_high":      int((acc["category"] == "high").sum()) if not acc.empty else 0,
+        "accel_peak_max":    round(acc["accel_peak"].max(), 2) if not acc.empty else 0.0,
         "hr_mean_bpm":       round(df["heart_rate"].mean(), 1) if df["heart_rate"].notna().any() else None,
         "hr_max_bpm":        int(df["heart_rate"].max()) if df["heart_rate"].notna().any() else None,
     }
@@ -298,7 +435,7 @@ def plot_season_trend(trend: pd.DataFrame, title: str = "Season-Trend") -> None:
 
     panels = [
         ("speed_max_kmh",     "Top-Speed (km/h)",       "#2196F3"),
-        ("n_sprints",         "Anzahl Sprints",          "#FB8C00"),
+        ("n_sprints",         "Anzahl Läufe ≥ 60% / Antritte", "#FB8C00"),
         ("sprint_distance_m", "Sprint-Distanz ges. (m)", "#43A047"),
     ]
 
@@ -319,6 +456,15 @@ def plot_season_trend(trend: pd.DataFrame, title: str = "Season-Trend") -> None:
                     (i_max, trend[col].iloc[i_max]),
                     textcoords="offset points", xytext=(0, 8),
                     fontsize=8, ha="center", color=color, fontweight="bold")
+
+    # Zweites Panel: Antritte zusätzlich zu den Läufen (gleiche Einheit: Anzahl)
+    if "n_accel" in trend.columns:
+        ax = flat_axes[1]
+        ax.plot(xi, trend["n_accel"], color="#E53935", linewidth=2,
+                marker="s", markersize=5, label="Antritte ≥ 2 m/s²")
+        ax.plot(xi, trend["n_sprints"], color="#FB8C00", linewidth=0,
+                label="Läufe ≥ 60% v_max")
+        ax.legend(fontsize=8, loc="upper left")
 
     # Viertes Panel: Herzfrequenz Ø + Max (gleiche Einheit -> ein Achsensystem)
     ax = flat_axes[3]
@@ -369,7 +515,18 @@ def plot_sprints(df: pd.DataFrame, title: str = "Sprint Detection") -> None:
             color="#90CAF9", linewidth=0.5, alpha=0.5, label="Speed (roh)", zorder=2)
     ax.fill_between(df["timestamp"], 0, df["speed_smooth"],
                     where=df["is_sprint"], color="#FF5722", alpha=0.4,
-                    label="Sprint", zorder=1)
+                    label="Lauf ≥ 60% v_max", zorder=1)
+
+    # Antritte als Dreiecke am Ende der Beschleunigungsphase
+    if "accel_id" in df.columns and df["accel_id"].max() > 0:
+        last = df[df["accel_id"] > 0].groupby("accel_id").tail(1)
+        hi   = last["accel"] >= ACCEL_HIGH_MS2
+        ax.scatter(last.loc[~hi, "timestamp"], last.loc[~hi, "speed_raw"],
+                   marker="^", s=25, color="#E53935", alpha=0.6,
+                   label=f"Antritt ≥ {ACCEL_MODERATE_MS2:g} m/s²", zorder=4)
+        ax.scatter(last.loc[hi, "timestamp"], last.loc[hi, "speed_raw"],
+                   marker="^", s=55, color="#B71C1C",
+                   label=f"Antritt ≥ {ACCEL_HIGH_MS2:g} m/s²", zorder=5)
     ax.set_ylabel("Geschwindigkeit (m/s)")
     ax.legend(loc="upper right", fontsize=8)
     ax.grid(True, alpha=0.3)
@@ -657,6 +814,7 @@ if __name__ == "__main__":
 
         df = load_fit(f)
         df = detect_sprints(df, v_max=v_max)
+        df = detect_accelerations(df)
         trend_rows.append(session_trend_row(df))
 
         print("\n  Zonenverteilung:")
@@ -668,7 +826,16 @@ if __name__ == "__main__":
             print(f"\n  Top {top_n} Sprints nach v_max:")
             print(stats.nlargest(top_n, "speed_max_ms")
                   [["sprint_id", "duration_s", "speed_max_kmh",
-                    "distance_m", "accel_peak"]]
+                    "distance_m", "category"]]
+                  .to_string(index=False))
+
+        acc = accel_summary(df)
+        if not acc.empty:
+            top_n = min(10, len(acc))
+            print(f"\n  Top {top_n} Antritte nach Peak-Beschleunigung:")
+            print(acc.nlargest(top_n, "accel_peak")
+                  [["accel_id", "time_start", "v_start_kmh", "v_end_kmh",
+                    "delta_v_kmh", "accel_peak", "category"]]
                   .to_string(index=False))
 
         session_name = os.path.splitext(os.path.basename(f))[0]

@@ -55,8 +55,9 @@ output/
 
 ## Funktionen im Detail (`sprint_detector.py`)
 
-- **`detect_sprints`** – klassifiziert jeden GPS-Punkt in eine Geschwindigkeitszone (Walking … Sprint) und markiert Sprint-Phasen relativ zu `v_max` (Standard: 60 %), inkl. Mindestdauer-Filter gegen GPS-Rauschen
-- **`sprint_summary`** – Kennzahlen pro Sprint (Dauer, v_max, Distanz, Peak-Beschleunigung)
+- **`detect_sprints`** – klassifiziert jeden GPS-Punkt in eine Geschwindigkeitszone (Walking … Sprint) und erkennt Läufe ab der Zone High Speed (≥ 60 % von `v_max`), inkl. Mindestdauer-Filter gegen GPS-Rauschen
+- **`sprint_summary`** – Kennzahlen pro Lauf (Dauer, v_max, Distanz, Peak-Beschleunigung) und Kategorie (`sprint` bei ≥ 80 % `v_max`, sonst `high_speed`)
+- **`detect_accelerations`** / **`accel_summary`** – erkennt explosive Antritte über die Beschleunigung (≥ 2 m/s², „hoch“ ab 3 m/s²), unabhängig von der erreichten Geschwindigkeit; Kennzahlen pro Antritt (Start-/Endgeschwindigkeit, Δv, Peak-Beschleunigung)
 - **`zone_distribution`** – prozentuale Zeitverteilung über die Geschwindigkeitszonen
 - **`plot_sprints`** – Speed-Verlauf mit Sprint-Phasen und echter Herzfrequenz (zweite Y-Achse)
 - **`plot_sprint_gps`** – interaktive Karte (Folium, Esri-Satellitenbild) mit farbcodierten Sprint-Routen; speichert eine `.html`-Datei und öffnet sie automatisch im Browser. Für das Hintergrundbild wird ein ArcGIS-API-Key benötigt (siehe unten). Ist `folium` nicht installiert, greift automatisch ein einfacher matplotlib-Fallback-Plot
@@ -78,7 +79,8 @@ Aus dem Ordner `src/` heraus (bzw. mit `src/` im Python-Pfad):
 
 ```python
 from loader import load_multiple, load_fit, personal_max_speed
-from sprint_detector import detect_sprints, sprint_summary, zone_distribution, plot_sprints
+from sprint_detector import (detect_sprints, detect_accelerations, sprint_summary,
+                             accel_summary, zone_distribution, plot_sprints)
 
 # Alle Sessions laden, um die persönliche Maximalgeschwindigkeit zu bestimmen
 df_all = load_multiple("../data/unikurs/")
@@ -87,9 +89,11 @@ v_max = personal_max_speed(df_all)
 # Einzelne Session analysieren
 df = load_fit("../data/unikurs/26-05-12.fit")
 df = detect_sprints(df, v_max=v_max)
+df = detect_accelerations(df)
 
 print(zone_distribution(df))
 print(sprint_summary(df))
+print(accel_summary(df))
 
 plot_sprints(df)
 ```
@@ -125,7 +129,7 @@ Die Schwellwertlogik orientiert sich an etablierten GPS-Metriken aus Profisport 
 
 ## Status / Limitationen
 
-- Aktuelle Sprint-Schwelle: 60 % von v_max, min. 2 s Dauer
+- Lauf-Schwelle: 60 % von v_max, min. 2 s Dauer; Antritt-Schwelle: 2 m/s² – beides Startwerte, die per Video validiert werden müssen
 - 1-Hz-Abtastrate ist für sehr kurze Spielzüge (3–5 s) grenzwertig
 - Kartenhintergrund benötigt einen ArcGIS-API-Key und eine Internetverbindung
 - Play-Segmentierung und Routen-Klassifikation sind für das nächste Semester geplant
