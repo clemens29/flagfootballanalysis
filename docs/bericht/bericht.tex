@@ -1,0 +1,139 @@
+% ============================================================
+%  Forschungsprojekt I – Flag Football GPS-Analyse
+%  Bericht im Format IEEE Transactions (Vorlage: IEEEtran)
+%  Kompilieren: pdflatex bericht.tex (zweimal, wegen Verweisen)
+% ============================================================
+\documentclass[journal]{IEEEtran}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[ngerman]{babel}
+\usepackage{amsmath}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{cite}
+\usepackage{url}
+
+\begin{document}
+
+\title{Automatische Sprint- und Antritt-Erkennung im Amateur-Flag-Football mit 1-Hz-GPS-Daten einer Sportuhr}
+
+\author{Clemens Näther%
+\thanks{Forschungsprojekt I, HTW Dresden, Trainingswissenschaft \& Sportinformatik.}}
+
+\markboth{Forschungsprojekt I, HTW Dresden, 2026}{}
+
+\maketitle
+
+% ------------------------------------------------------------
+\begin{abstract}
+% TODO: (ca. 150--250 Wörter)
+% Aufbau: Problem -- Forschungsfrage -- Methode -- wichtigstes Ergebnis -- Fazit.
+\end{abstract}
+
+\begin{IEEEkeywords}
+
+\end{IEEEkeywords}
+
+% ------------------------------------------------------------
+\section{Einleitung}
+
+\IEEEPARstart{F}{lag} Football wächst als Breiten- und Wettkampfsport, wissenschaftliche
+Belastungsanalysen gibt es bisher jedoch kaum. Im Profisport werden Laufbelastungen
+mit GPS-Systemen erfasst, die für Amateurvereine zu teuer sind. Viele Spieler tragen
+aber bereits eine GPS-Sportuhr.
+
+% TODO: 2--3 Sätze zur Lücke: Warum reicht das, was es gibt, nicht aus?
+
+Daraus ergibt sich die Forschungsfrage dieser Arbeit:
+
+\begin{quote}
+\textit{Lassen sich aus 1-Hz-GPS-Daten einer Consumer-Sportuhr im Amateur-Flag-Football
+Sprints und explosive Antritte automatisch erkennen, sodass sie für Coaching-Feedback
+nutzbar sind?}
+\end{quote}
+
+% TODO: Beitrag der Arbeit in 2--3 Stichpunkten, z.B. Pipeline, Schwellen, Replay-Tool.
+
+% ------------------------------------------------------------
+\section{Verwandte Arbeiten}
+
+% TODO: Kurz halten (1--2 Absätze).
+% - GPS-Metriken und individuelle Geschwindigkeitszonen im Teamsport [1]
+% - Validität von GPS bei kurzen Sprints / niedriger Abtastrate [2]
+% - Segmentierung von Bewegungen mit Wearables [3]
+% - Tracking-Daten im American Football [4]
+
+% ------------------------------------------------------------
+\section{Methodik}
+
+\subsection{Datengrundlage}
+Erfasst wurden 14 Einheiten eines Spielers mit einer Garmin-Uhr (1\,Hz):
+8 Einheiten aus einem Uni-Kurs, 3 Vereinstrainings und 3 Turnierspiele.
+
+% TODO: Uhrmodell, Spielposition, Zeitraum ergänzen.
+
+\subsection{Vorverarbeitung}
+Geschwindigkeitswerte über 12\,m/s werden als Ausreißer verworfen und linear
+interpoliert. Anschließend wird die Geschwindigkeit mit einem zentrierten
+gleitenden Mittelwert über drei Samples geglättet:
+\begin{equation}
+  \hat{v}(t) = \frac{1}{3}\sum_{k=-1}^{1} v(t+k).
+\end{equation}
+
+\subsection{Sprint- und Antritt-Erkennung}
+Alle Schwellen beziehen sich auf die persönliche Maximalgeschwindigkeit
+$v_{\max}$ (99,99.~Perzentil über alle Einheiten) \cite{sfs_metrics}.
+Ein Lauf liegt vor, wenn
+\begin{equation}
+  \hat{v}(t) \geq 0{,}6 \cdot v_{\max}
+\end{equation}
+für mindestens 2\,s gilt \cite{sfs_validity}. Antritte werden getrennt über die
+Beschleunigung $a(t) \geq 2\,\text{m/s}^2$ erkannt.
+
+% TODO: Später ggf. Tabelle der Geschwindigkeitszonen aus doku.md übernehmen.
+
+% ------------------------------------------------------------
+\section{Ergebnisse}
+
+% TODO: Erst füllen, wenn die Zahlen feststehen. Vorschlag:
+% - Tabelle: Sprints und Antritte je Kontext (Uni-Kurs / Training / Turnier)
+% - Abbildung: Speed-Verlauf einer Beispiel-Session (plot_sprints)
+
+% ------------------------------------------------------------
+\section{Diskussion}
+
+% TODO: Forschungsfrage beantworten, dann Limitationen:
+% - 1\,Hz ist für sehr kurze Aktionen grenzwertig
+% - Schwellen noch nicht per Video validiert
+% - nur ein Proband
+
+% ------------------------------------------------------------
+\section{Fazit und Ausblick}
+
+% TODO: 1 Absatz Fazit; Ausblick: Spielzug-Segmentierung, Routen-Klassifikation, Dashboard.
+
+% ------------------------------------------------------------
+\begin{thebibliography}{9}
+
+\bibitem{sfs_metrics}
+Science for Sport, ``GPS wearables: Metrics and application.''
+[Online]. Verfügbar: \url{https://www.scienceforsport.com/gps-wearables-metrics-and-application/}
+
+\bibitem{sfs_validity}
+Science for Sport, ``GPS wearables: Validity and reliability.''
+[Online]. Verfügbar: \url{https://www.scienceforsport.com/gps-wearables-validity-and-reliability/}
+
+\bibitem{kim2018}
+W.~Kim and M.~Kim, ``On-line detection and segmentation of sports motions using a
+wearable sensor,'' \textit{Sensors}, vol.~18, no.~3, p.~913, 2018,
+doi: 10.3390/s18030913.
+
+\bibitem{yurko2025}
+R.~Yurko \textit{et al.}, ``Fractional tackles: Leveraging player tracking data for
+within-play tackling evaluation,'' 2025. [Online]. Verfügbar:
+\url{https://www.ncbi.nlm.nih.gov/pmc/articles/PMC11739690/}
+
+\end{thebibliography}
+
+\end{document}

@@ -23,6 +23,11 @@ Verwendung:
     python src/replay.py data/trainingMonarchs/26-10-29.fit
     python src/replay.py data/            (alle Unterordner)
 
+    python src/replay.py data/ --embed-tiles
+                          Satellitenbild direkt in die Datei einbetten
+                          → output/replay_offline.html (fürs Handy / zum
+                          Teilen, läuft ohne Kachel-Server und ohne Key)
+
 Ausgabe: output/replay.html (öffnet sich automatisch im Browser)
 """
 
@@ -33,6 +38,9 @@ import json
 import warnings
 import contextlib
 import io
+import math
+import base64
+import urllib.request
 
 import numpy as np
 import pandas as pd
@@ -163,7 +171,86 @@ def session_payload(path: str, v_max: float, label: str) -> dict:
     }
 
 
-def build_replay(files, out_file, v_max):
+# ============================================================
+# SATELLITENBILD EINBETTEN (--embed-tiles)
+# ============================================================
+# Für die Handy-/Teilen-Version werden die nötigen Esri-Kacheln einmal
+# heruntergeladen (mit ARCGIS_API_KEY, falls gesetzt) und als data:-URIs in
+# die HTML geschrieben. Der Key landet dabei NICHT in der Datei.
+TILE_ZOOMS = (16, 19)        # eingebettete Zoomstufen (min, max)
+TILE_MARGIN_M = 100          # Rand um die Laufwege, mindestens
+TILE_CACHE = "tile_cache"    # unter output/, wird wiederverwendet
+
+
+def _deg2tile(lat, lon, z):
+    n = 2 ** z
+    r = math.radians(lat)
+    x = (lon + 180.0) / 360.0 * n
+    y = (1 - math.log(math.tan(r) + 1 / math.cos(r)) / math.pi) / 2 * n
+    return int(math.floor(x)), int(math.floor(y))
+
+
+def _tiles_for_sessions(sessions):
+    """Alle Kacheln (z, x, y), die die Laufwege jeder Session plus Rand abdecken."""
+    keys = set()
+    for s in sessions:
+        xs = np.array([v for v in s["x"] if v is not None], dtype=float)
+        ys = np.array([v for v in s["y"] if v is not None], dtype=float)
+        if not len(xs):
+            continue
+        x0, x1 = np.percentile(xs, [0.5, 99.5])
+        y0, y1 = np.percentile(ys, [0.5, 99.5])
+        m = max(TILE_MARGIN_M, 0.6 * max(x1 - x0, y1 - y0))
+        kx = math.cos(math.radians(s["lat0"])) * M_PER_DEG_LON
+        lon_w, lon_e = s["lon0"] + (x0 - m) / kx, s["lon0"] + (x1 + m) / kx
+        lat_s, lat_n = s["lat0"] + (y0 - m) / M_PER_DEG_LAT, s["lat0"] + (y1 + m) / M_PER_DEG_LAT
+        for z in range(TILE_ZOOMS[0], TILE_ZOOMS[1] + 1):
+            xa, ya = _deg2tile(lat_n, lon_w, z)
+            xb, yb = _deg2tile(lat_s, lon_e, z)
+            for tx in range(xa, xb + 1):
+                for ty in range(ya, yb + 1):
+                    keys.add((z, tx, ty))
+    return sorted(keys)
+
+
+def _embed_tiles(sessions, tile_url, cache_dir):
+    """Kacheln laden (Cache unter output/tile_cache) → {"z/x/y": data-URI}."""
+    keys = _tiles_for_sessions(sessions)
+    print(f"  Satellitenbild einbetten: {len(keys)} Kacheln (Zoom {TILE_ZOOMS[0]}–{TILE_ZOOMS[1]})")
+    out, fails, loaded = {}, 0, 0
+    for i, (z, x, y) in enumerate(keys, 1):
+        p = os.path.join(cache_dir, str(z), str(x), f"{y}.img")
+        if not os.path.exists(p):
+            url = tile_url.replace("{z}", str(z)).replace("{x}", str(x)).replace("{y}", str(y))
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "flagfootballanalysis-replay"})
+                with urllib.request.urlopen(req, timeout=20) as r:
+                    data, ctype = r.read(), r.headers.get("Content-Type", "")
+                if not ctype.startswith("image/"):
+                    raise ValueError(f"keine Bilddaten ({ctype})")
+                os.makedirs(os.path.dirname(p), exist_ok=True)
+                with open(p, "wb") as fh:
+                    fh.write(data)
+                loaded += 1
+            except Exception as e:
+                fails += 1
+                if fails <= 3:
+                    print(f"\n    ✗ Kachel {z}/{x}/{y}: {e}")
+                continue
+        with open(p, "rb") as fh:
+            b = fh.read()
+        mime = "image/png" if b[:4] == b"\x89PNG" else "image/jpeg"
+        out[f"{z}/{x}/{y}"] = f"data:{mime};base64," + base64.b64encode(b).decode("ascii")
+        print(f"\r    {i}/{len(keys)} Kacheln", end="", flush=True)
+    size_mb = sum(len(v) for v in out.values()) / 1e6
+    print(f"\r    {len(out)}/{len(keys)} Kacheln eingebettet "
+          f"({loaded} neu geladen, {fails} fehlgeschlagen) · {size_mb:.1f} MB")
+    if fails and not out:
+        print("    Hinweis: keine Kachel geladen – ARCGIS_API_KEY gesetzt? Internet?")
+    return out
+
+
+def build_replay(files, out_file, v_max, embed_tiles=False):
     sessions = []
     for f in files:
         rel = os.path.relpath(f, os.path.commonpath(files) if len(files) > 1 else os.path.dirname(f))
@@ -188,6 +275,14 @@ def build_replay(files, out_file, v_max):
                     "World_Imagery/MapServer/tile/{z}/{y}/{x}")
         print("  Kartenhintergrund: Esri World Imagery (öffentlicher Endpunkt)")
 
+    public_url = ("https://server.arcgisonline.com/ArcGIS/rest/services/"
+                  "World_Imagery/MapServer/tile/{z}/{y}/{x}")
+    tiles = None
+    if embed_tiles:
+        tiles = _embed_tiles(sessions, tile_url,
+                             os.path.join(os.path.dirname(out_file), TILE_CACHE))
+        tile_url = public_url          # Key nie in die eingebettete Datei
+
     payload = {
         "tileUrl": tile_url,
         "vmax": round(float(v_max), 3),
@@ -196,6 +291,9 @@ def build_replay(files, out_file, v_max):
         "accelHigh": ACCEL_HIGH_MS2,
         "sessions": sessions,
     }
+    if tiles is not None:
+        payload["tiles"] = tiles
+        payload["tileZoom"] = list(TILE_ZOOMS)
     html = HTML_TEMPLATE.replace("__DATA__", json.dumps(payload, separators=(",", ":")))
     os.makedirs(os.path.dirname(out_file), exist_ok=True)
     with open(out_file, "w", encoding="utf-8") as fh:
@@ -254,7 +352,7 @@ aside{display:flex;flex-direction:column;gap:10px;min-height:0}
 footer{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:10px 12px;display:grid;gap:8px}
 .controls{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
 #clock{font-variant-numeric:tabular-nums;font-weight:600;min-width:150px}
-#timeline{width:100%;height:90px;display:block;cursor:crosshair;border-radius:8px}
+#timeline{width:100%;height:90px;display:block;cursor:crosshair;border-radius:8px;touch-action:none}
 .hint{color:var(--muted);font-size:12px}
 .overlay{position:absolute;left:10px;top:10px;display:flex;flex-wrap:wrap;gap:6px;align-items:center;
   background:rgba(15,20,18,.78);border:1px solid var(--line);border-radius:10px;padding:6px;backdrop-filter:blur(4px)}
@@ -263,11 +361,33 @@ footer{background:var(--panel);border:1px solid var(--line);border-radius:12px;p
 #angle{font-variant-numeric:tabular-nums;font-size:12px;color:var(--muted);min-width:150px}
 #mapNote{position:absolute;left:10px;bottom:40px;font-size:12px;color:#ffd27a;display:none}
 #rec.recording{background:var(--hot);border-color:var(--hot);color:#fff}
+#field{cursor:grab}
+/* Vollbild (CSS – klappt auch dort, wo die Fullscreen-API fehlt, z.B. iPhone) */
+#fsbar{display:none}
+#fsHint{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);background:rgba(15,20,18,.85);
+  border:1px solid var(--line);border-radius:10px;padding:10px 14px;font-size:13px;text-align:center;
+  pointer-events:none;opacity:0;transition:opacity .4s;max-width:80%}
+#fsHint.show{opacity:1}
+body.fs{overflow:hidden}
+body.fs .fieldwrap{position:fixed;inset:0;z-index:50;border-radius:0;min-height:0;height:100dvh}
+body.fs #field{touch-action:none;bottom:auto;height:calc(100% - 58px - env(safe-area-inset-bottom))}
+body.fs #fsbar{display:flex;position:absolute;left:0;right:0;bottom:0;gap:8px;align-items:center;
+  background:var(--panel);border-top:1px solid var(--line);
+  padding:8px 10px calc(8px + env(safe-area-inset-bottom))}
+body.fs #mapNote{bottom:80px}
+#fsbar button{padding:6px 10px}
+#fsPlay{min-width:44px}
+#fsSeek{flex:1;min-width:60px;accent-color:#ffcc33}
+#fsInfo{font-variant-numeric:tabular-nums;font-size:12px;white-space:nowrap;text-align:right;line-height:1.25}
 @media (max-width:860px){
   .app{height:auto;min-height:100vh;display:flex;flex-direction:column}
   main{grid-template-columns:1fr}
-  .fieldwrap{min-height:55vh}
+  .fieldwrap{min-height:62vh}
   #events{max-height:180px}
+  /* Feindrehung per Button nur am Desktop – am Handy mit zwei Fingern drehen */
+  #rotM,#rotP,#rot90,#angle,.overlay .sep{display:none}
+  .overlay{left:6px;top:6px;padding:4px;gap:4px}
+  .overlay button{padding:5px 8px;font-size:12px}
 }
 </style>
 </head>
@@ -294,6 +414,8 @@ footer{background:var(--panel);border:1px solid var(--line);border-radius:12px;p
     <div class="fieldwrap">
       <canvas id="field"></canvas>
       <div class="overlay">
+        <button id="fsBtn" title="Vollbild – mit 1 Finger verschieben, mit 2 Fingern zoomen und drehen">⛶ Vollbild</button>
+        <button id="followBtn" title="Karte läuft mit dem Spieler mit">Folgen</button>
         <button id="mapBtn" class="on" title="Satellitenbild ein/aus">Satellit</button>
         <span class="sep"></span>
         <button id="orAuto" class="on" title="Feld-Längsachse horizontal (Ausrichtung des Platzes)">Feld</button>
@@ -306,6 +428,14 @@ footer{background:var(--panel);border:1px solid var(--line);border-radius:12px;p
         <span id="angle">–</span>
       </div>
       <div id="mapNote">Satellitenbild konnte nicht geladen werden (offline?)</div>
+      <div id="fsHint">1 Finger: verschieben · 2 Finger: zoomen &amp; drehen<br>Doppeltipp: Ansicht zurücksetzen</div>
+      <div id="fsbar">
+        <button id="fsPlay" title="Play/Pause">▶</button>
+        <button id="fsRate" title="Tempo">10×</button>
+        <input id="fsSeek" type="range" min="0" max="1000" value="0" aria-label="Zeit im Intervall">
+        <span id="fsInfo">–</span>
+        <button id="fsClose" title="Vollbild beenden">✕</button>
+      </div>
     </div>
     <aside>
       <div class="card">
@@ -365,6 +495,9 @@ let lastFrame = null, recorder = null;
 let view = null;            // Feld-Transformation fürs Intervall
 let rot = 0;                // Anzeige-Drehung (rad, gegen Uhrzeigersinn = Norden wandert nach links)
 let mapOn = true, northUp = false;
+// Ansicht: Zoom/Verschiebung (Anzeige-Meter) per Geste, "Folgen" zentriert auf den Spieler
+let zoom = 1, panX = 0, panY = 0, follow = false;
+let lastSc = 1, lastCx = 0, lastCy = 0;   // zuletzt gezeichnete Skalierung / Mitte
 const tiles = new Map(); let tileFails = 0, tileOk = 0, drawPending = false;
 
 // ---------- Hilfen ----------
@@ -407,7 +540,7 @@ function loadSession(k){
 function setInterval_(a,b){
   t0=Math.max(0,Math.min(a,b)); t1=Math.min(S.t[S.t.length-1],Math.max(a,b));
   if(t1-t0<5) t1=Math.min(S.t[S.t.length-1],t0+5);
-  cur=t0; computeView(); buildEvents(); draw();
+  cur=t0; zoom=1; panX=0; panY=0; computeView(); buildEvents(); draw();
 }
 function preset(p){
   const end=S.t[S.t.length-1];
@@ -451,22 +584,28 @@ function resize(){
 }
 function drawField(ctx,W,H,hud){
   ctx.fillStyle="#183326"; ctx.fillRect(0,0,W,H);
-  const sc=Math.min(W/view.w, H/view.h);
-  const X=x=>W/2+(x-view.cx)*sc, Y=y=>H/2-(y-view.cy)*sc;     // Anzeige-Koord. → Pixel
+  const now=stateAt(cur);
+  // Mindeststärken in CSS-Pixeln – sonst wird auf hochauflösenden Handys alles sehr dünn
+  const dpr=window.devicePixelRatio||1;
+  const sc=Math.min(W/view.w, H/view.h)*zoom;
+  let vcx=view.cx+panX, vcy=view.cy+panY;
+  if(follow && now.x!=null && !isNaN(now.x)){ const d=disp(now.x,now.y); vcx=d[0]; vcy=d[1]; }
+  if(ctx===fctx){ lastSc=sc; lastCx=vcx; lastCy=vcy; }
+  const X=x=>W/2+(x-vcx)*sc, Y=y=>H/2-(y-vcy)*sc;     // Anzeige-Koord. → Pixel
   const P=(x,y)=>{ const d=disp(x,y); return [X(d[0]),Y(d[1])]; }; // lokale Meter → Pixel
 
-  if(mapOn) drawTiles(ctx,W,H,sc,P);
+  if(mapOn) drawTiles(ctx,W,H,sc,P,vcx,vcy);
 
   // Raster alle 10 m (Yard-Linien-Optik) – liegt parallel zur Feldausrichtung
   ctx.strokeStyle=mapOn?"rgba(255,255,255,.18)":"rgba(255,255,255,.08)"; ctx.lineWidth=1;
-  const gx0=Math.floor((view.cx-W/sc/2)/10)*10, gx1=view.cx+W/sc/2;
+  const gx0=Math.floor((vcx-W/sc/2)/10)*10, gx1=vcx+W/sc/2;
   for(let g=gx0; g<=gx1; g+=10){ ctx.beginPath(); ctx.moveTo(X(g),0); ctx.lineTo(X(g),H); ctx.stroke(); }
-  const gy0=Math.floor((view.cy-H/sc/2)/10)*10, gy1=view.cy+H/sc/2;
+  const gy0=Math.floor((vcy-H/sc/2)/10)*10, gy1=vcy+H/sc/2;
   for(let g=gy0; g<=gy1; g+=10){ ctx.beginPath(); ctx.moveTo(0,Y(g)); ctx.lineTo(W,Y(g)); ctx.stroke(); }
 
   const i0=idxAt(t0), ic=idxAt(cur);
   // Geisterpfad: gesamtes Intervall
-  ctx.strokeStyle=mapOn?"rgba(255,255,255,.22)":"rgba(255,255,255,.07)"; ctx.lineWidth=1.2*(W/1000+.5);
+  ctx.strokeStyle=mapOn?"rgba(255,255,255,.22)":"rgba(255,255,255,.07)"; ctx.lineWidth=Math.max(1.2*(W/1000+.5), 1.6*dpr);
   ctx.beginPath(); let pen=false;
   for(let i=i0;i<=idxAt(t1);i++){
     if(S.x[i]==null){pen=false;continue;}
@@ -478,9 +617,8 @@ function drawField(ctx,W,H,hud){
 
   // Spur bis jetzt, nach Speed eingefärbt
   const ts = trail>0 ? Math.max(t0,cur-trail) : t0;
-  const is=idxAt(ts); const lw=Math.max(3, W/220);
+  const is=idxAt(ts); const lw=Math.max(3, W/220, 4.2*dpr);
   ctx.lineCap="round";
-  const now=stateAt(cur);
   for(let i=Math.max(is,i0)+1;i<=ic+1 && i<S.t.length;i++){
     if(S.seg[i]!==S.seg[i-1]||S.x[i]==null||S.x[i-1]==null) continue;
     // letztes Stück nur bis zur interpolierten aktuellen Position
@@ -501,7 +639,7 @@ function drawField(ctx,W,H,hud){
   for(const a of S.accels){
     if(a[1]<ts || a[1]>cur || a[1]<t0) continue;
     const k=idxAt(a[1]); if(S.x[k]==null) continue;
-    const [px,py]=P(S.x[k],S.y[k]), r=(a[5]?9:6)*(W/1000+.5);
+    const [px,py]=P(S.x[k],S.y[k]), r=Math.max((a[5]?9:6)*(W/1000+.5), (a[5]?8:6)*dpr);
     ctx.fillStyle=a[5]?"#ff4d3d":"#ff9a8f"; ctx.strokeStyle="#111"; ctx.lineWidth=1;
     ctx.beginPath(); ctx.moveTo(px,py-r); ctx.lineTo(px+r*.87,py+r*.5); ctx.lineTo(px-r*.87,py+r*.5); ctx.closePath();
     ctx.fill(); ctx.stroke();
@@ -509,9 +647,9 @@ function drawField(ctx,W,H,hud){
 
   // Aktuelle Position
   if(now.x!=null && !isNaN(now.x)){
-    const [px,py]=P(now.x,now.y), r=Math.max(6,W/120);
+    const [px,py]=P(now.x,now.y), r=Math.max(6,W/120,8*dpr);
     ctx.fillStyle="rgba(255,204,51,.22)"; ctx.beginPath(); ctx.arc(px,py,r*2.2,0,7); ctx.fill();
-    ctx.fillStyle="#ffcc33"; ctx.strokeStyle="#111"; ctx.lineWidth=2;
+    ctx.fillStyle="#ffcc33"; ctx.strokeStyle="#111"; ctx.lineWidth=Math.max(2,1.5*dpr);
     ctx.beginPath(); ctx.arc(px,py,r,0,7); ctx.fill(); ctx.stroke();
   }
 
@@ -520,7 +658,7 @@ function drawField(ctx,W,H,hud){
   ctx.strokeStyle="rgba(255,255,255,.6)"; ctx.lineWidth=2; ctx.beginPath();
   ctx.moveTo(pad,H-pad); ctx.lineTo(pad+m10,H-pad); ctx.moveTo(pad,H-pad-5); ctx.lineTo(pad,H-pad+5);
   ctx.moveTo(pad+m10,H-pad-5); ctx.lineTo(pad+m10,H-pad+5); ctx.stroke();
-  ctx.fillStyle="rgba(255,255,255,.7)"; ctx.font=`${Math.round(12*(W/1000+.6))}px system-ui`;
+  ctx.fillStyle="rgba(255,255,255,.7)"; ctx.font=`${Math.round(Math.max(12*(W/1000+.6), 11*dpr))}px system-ui`;
   ctx.fillText("10 m", pad, H-pad-9);
 
   // Nordpfeil
@@ -560,24 +698,27 @@ function ty2lat(y,z){ const n=Math.PI-2*Math.PI*y/2**z; return Math.atan(Math.si
 function requestDraw(){ if(drawPending||playing) return; drawPending=true; requestAnimationFrame(()=>{ drawPending=false; draw(); }); }
 function getTile(z,x,y){
   const k=`${z}/${x}/${y}`; let t=tiles.get(k);
+  const emb = DATA.tiles ? DATA.tiles[k] : null;
+  if(DATA.tiles && !emb) return {ok:false};      // eingebettet: außerhalb nichts nachladen
   if(!t){ const img=new Image(); img.crossOrigin="anonymous";
     t={img,ok:false}; tiles.set(k,t);
     img.onload=()=>{ t.ok=true; tileOk++; $("mapNote").style.display="none"; requestDraw(); };
     img.onerror=()=>{ tileFails++; if(!tileOk && tileFails>3) $("mapNote").style.display="block"; };
-    img.src=DATA.tileUrl.replace("{z}",z).replace("{x}",x).replace("{y}",y); }
+    img.src=emb || DATA.tileUrl.replace("{z}",z).replace("{x}",x).replace("{y}",y); }
   return t;
 }
-function drawTiles(ctx,W,H,sc,P){
+function drawTiles(ctx,W,H,sc,P,vcx,vcy){
   const kx=Math.cos(S.lat0*D2R)*111320, ky=110540;
   const toLocal=(lat,lon)=>[(lon-S.lon0)*kx,(lat-S.lat0)*ky];
   // Bildschirmecken → lokale Meter → Lat/Lon (für den Kachelbereich)
   const r=curRot(), c=Math.cos(r), s=Math.sin(r);
-  const inv=(px,py)=>{ const dx=(px-W/2)/sc+view.cx, dy=-(py-H/2)/sc+view.cy; return [dx*c-dy*s, dx*s+dy*c]; };
+  const inv=(px,py)=>{ const dx=(px-W/2)/sc+vcx, dy=-(py-H/2)/sc+vcy; return [dx*c-dy*s, dx*s+dy*c]; };
   let la0=90,la1=-90,lo0=180,lo1=-180;
   for(const [px,py] of [[0,0],[W,0],[0,H],[W,H]]){ const [x,y]=inv(px,py);
     const lat=S.lat0+y/ky, lon=S.lon0+x/kx; la0=Math.min(la0,lat); la1=Math.max(la1,lat); lo0=Math.min(lo0,lon); lo1=Math.max(lo1,lon); }
   // Zoom so wählen, dass 1 Kachelpixel ≈ 1 Bildschirmpixel
-  const z=Math.max(3,Math.min(19,Math.ceil(Math.log2(156543.03*Math.cos(S.lat0*D2R)*sc))));
+  let z=Math.max(3,Math.min(19,Math.ceil(Math.log2(156543.03*Math.cos(S.lat0*D2R)*sc))));
+  if(DATA.tileZoom) z=Math.max(DATA.tileZoom[0],Math.min(DATA.tileZoom[1],z));
   const x0=Math.floor(lon2tx(lo0,z)), x1=Math.floor(lon2tx(lo1,z));
   const y0=Math.floor(lat2ty(la1,z)), y1=Math.floor(lat2ty(la0,z));
   if((x1-x0+1)*(y1-y0+1)>200) return;
@@ -647,6 +788,10 @@ function updatePanel(){
   $("sAcc").textContent=`${acc.length} (${acc.filter(e=>e[5]).length})`;
   $("sRun").textContent=S.sprints.filter(e=>e[0]>=t0&&e[0]<=cur).length;
   for(const d of $("events").children){ if(d.dataset.t!==undefined) d.classList.toggle("past", +d.dataset.t<=cur); }
+  if(document.body.classList.contains("fs")){
+    if(!seeking) $("fsSeek").value=Math.round((cur-t0)/((t1-t0)||1)*1000);
+    $("fsInfo").innerHTML=`${fmtClock(cur)}<br><b>${(st.v*3.6).toFixed(1)}</b> km/h`;
+  }
 }
 
 function draw(){
@@ -657,7 +802,7 @@ function draw(){
 
 // ---------- Abspielen ----------
 function setPlaying(p){
-  playing=p; $("play").textContent=p?"❚❚ Pause":"▶ Play"; lastFrame=null;
+  playing=p; $("play").textContent=p?"❚❚ Pause":"▶ Play"; $("fsPlay").textContent=p?"❚❚":"▶"; lastFrame=null;
   if(p){ if(cur>=t1) cur=t0; requestAnimationFrame(tick); }
 }
 function tick(ts){
@@ -721,7 +866,8 @@ $("orNorth").onclick=()=>{ northUp=true; syncOrientButtons(); computeView(); dra
 $("rotM").onclick=e=>setRot(rot-(e.shiftKey?10:1)*D2R);
 $("rotP").onclick=e=>setRot(rot+(e.shiftKey?10:1)*D2R);
 $("rot90").onclick=()=>setRot(rot+90*D2R);
-$("rotReset").onclick=()=>{ try{ localStorage.removeItem(rotKey()); }catch(e){} rot=S.ang; syncOrientButtons(); computeView(); draw(); };
+$("rotReset").onclick=()=>{ try{ localStorage.removeItem(rotKey()); }catch(e){} rot=S.ang;
+  zoom=1; panX=0; panY=0; follow=false; syncFollow(); syncOrientButtons(); computeView(); draw(); };
 $("play").onclick=()=>setPlaying(!playing);
 $("rec").onclick=()=>recorder?stopRec():startRec();
 document.querySelectorAll("[data-rate]").forEach(b=>b.onclick=()=>{
@@ -731,10 +877,101 @@ document.querySelectorAll("[data-trail]").forEach(b=>b.onclick=()=>{
 document.querySelectorAll("[data-preset]").forEach(b=>b.onclick=()=>preset(b.dataset.preset));
 document.addEventListener("keydown",e=>{
   if(e.target.tagName==="SELECT") return;
+  if(e.code==="Escape" && document.body.classList.contains("fs")) setFs(false);
   if(e.code==="Space"){ e.preventDefault(); setPlaying(!playing); }
   if(e.code==="ArrowRight"){ cur=Math.min(t1,cur+5); draw(); }
   if(e.code==="ArrowLeft"){ cur=Math.max(t0,cur-5); draw(); }
 });
+// ---------- Gesten: verschieben / zoomen / drehen ----------
+// Maus immer (ziehen + Mausrad), Touch nur im Vollbild – sonst scrollt die Seite.
+const ptrs=new Map(); let lastTap=0, tapMoved=false, rotChanged=false, seeking=false;
+function gestureOn(e){ return e.pointerType==="mouse" || document.body.classList.contains("fs"); }
+function canvasPt(e){ const r=field.getBoundingClientRect(), k=field.width/(r.width||1);
+  return [(e.clientX-r.left)*k, (e.clientY-r.top)*k]; }
+function redraw(){ if(!playing) draw(); }
+function syncFollow(){ $("followBtn").classList.toggle("on",follow); }
+function unfollow(){ if(!follow) return; follow=false; panX=lastCx-view.cx; panY=lastCy-view.cy; syncFollow(); }
+function zoomAt(px,py,f){
+  const W=field.width, H=field.height;
+  const wx=lastCx+(px-W/2)/lastSc, wy=lastCy-(py-H/2)/lastSc;      // Punkt unter dem Finger
+  const nz=Math.max(.5,Math.min(20,zoom*f)), nsc=lastSc*nz/zoom; zoom=nz;
+  if(!follow){ panX=wx-(px-W/2)/nsc-view.cx; panY=wy+(py-H/2)/nsc-view.cy;
+    lastCx=view.cx+panX; lastCy=view.cy+panY; }
+  lastSc=nsc;
+}
+function panBy(dx,dy){ if(follow) return; panX-=dx/lastSc; panY+=dy/lastSc;
+  lastCx=view.cx+panX; lastCy=view.cy+panY; }
+function rotateBy(da){
+  if(northUp||!da) return;
+  // Bildmitte festhalten: Anzeige → lokale Meter, drehen, wieder zurück
+  const r=curRot(), c=Math.cos(r), s=Math.sin(r);
+  const lx=lastCx*c-lastCy*s, ly=lastCx*s+lastCy*c;
+  rot+=da; rotChanged=true; const d=disp(lx,ly);
+  if(!follow){ panX=d[0]-view.cx; panY=d[1]-view.cy; } lastCx=d[0]; lastCy=d[1];
+}
+function pair(){ const [p,q]=[...ptrs.values()];
+  return {mx:(p[0]+q[0])/2, my:(p[1]+q[1])/2, d:Math.hypot(q[0]-p[0],q[1]-p[1])||1,
+          a:Math.atan2(q[1]-p[1],q[0]-p[0])}; }
+function resetView(){ zoom=1; panX=0; panY=0; follow=false; syncFollow(); redraw(); }
+field.addEventListener("pointerdown",e=>{
+  if(!gestureOn(e)) return;
+  try{ field.setPointerCapture(e.pointerId); }catch(_){}
+  ptrs.set(e.pointerId,canvasPt(e));
+  if(ptrs.size===1){ const t=performance.now();
+    if(t-lastTap<300 && !tapMoved){ resetView(); lastTap=0; } else lastTap=t;
+    tapMoved=false; field.style.cursor="grabbing"; }
+});
+field.addEventListener("pointermove",e=>{
+  if(!ptrs.has(e.pointerId)) return;
+  const p=canvasPt(e), old=ptrs.get(e.pointerId);
+  if(Math.hypot(p[0]-old[0],p[1]-old[1])>3) tapMoved=true;
+  if(ptrs.size===1){ if(tapMoved) unfollow(); ptrs.set(e.pointerId,p); panBy(p[0]-old[0],p[1]-old[1]); }
+  else if(ptrs.size===2){
+    const b=pair(); ptrs.set(e.pointerId,p); const a=pair();
+    let da=a.a-b.a; if(da>Math.PI) da-=2*Math.PI; if(da<-Math.PI) da+=2*Math.PI;
+    zoomAt(a.mx,a.my,a.d/b.d); panBy(a.mx-b.mx,a.my-b.my); rotateBy(da);
+  } else ptrs.set(e.pointerId,p);
+  redraw();
+});
+function endPtr(e){
+  if(!ptrs.delete(e.pointerId)) return;
+  if(!ptrs.size){ field.style.cursor="";
+    if(rotChanged){ rotChanged=false; try{ localStorage.setItem(rotKey(), String(rot)); }catch(_){} syncOrientButtons(); } }
+}
+field.addEventListener("pointerup",endPtr); field.addEventListener("pointercancel",endPtr);
+field.addEventListener("wheel",e=>{ e.preventDefault(); const p=canvasPt(e);
+  zoomAt(p[0],p[1],Math.exp(-e.deltaY*0.0015)); redraw(); },{passive:false});
+
+$("followBtn").onclick=()=>{ follow=!follow; if(follow && zoom<2.5) zoom=2.5;
+  if(!follow){ panX=lastCx-view.cx; panY=lastCy-view.cy; } syncFollow(); redraw(); };
+
+// ---------- Vollbild ----------
+let hintTimer=null;
+function setFs(on){
+  document.body.classList.toggle("fs",on); $("fsBtn").classList.toggle("on",on);
+  $("fsBtn").textContent=on?"✕ Vollbild":"⛶ Vollbild";
+  const el=document.documentElement;
+  try{
+    if(on && !document.fullscreenElement && el.requestFullscreen) el.requestFullscreen().catch(()=>{});
+    if(!on && document.fullscreenElement) document.exitFullscreen().catch(()=>{});
+  }catch(_){}
+  if(on){ $("fsHint").classList.add("show"); clearTimeout(hintTimer);
+    hintTimer=setTimeout(()=>$("fsHint").classList.remove("show"),3200); }
+  else $("fsHint").classList.remove("show");
+  requestAnimationFrame(resize);
+}
+document.addEventListener("fullscreenchange",()=>{
+  if(!document.fullscreenElement && document.body.classList.contains("fs")) setFs(false);
+  else requestAnimationFrame(resize);
+});
+$("fsBtn").onclick=()=>setFs(!document.body.classList.contains("fs"));
+$("fsClose").onclick=()=>setFs(false);
+$("fsPlay").onclick=()=>setPlaying(!playing);
+$("fsRate").onclick=()=>{ const rs=[1,5,10,30,60], n=rs[(rs.indexOf(rate)+1)%rs.length];
+  document.querySelector(`[data-rate="${n}"]`).click(); };
+document.querySelectorAll("[data-rate]").forEach(b=>b.addEventListener("click",()=>{ $("fsRate").textContent=rate+"×"; }));
+$("fsSeek").addEventListener("input",e=>{ seeking=true; cur=t0+(t1-t0)*(+e.target.value)/1000; draw(); seeking=false; });
+
 const sel=$("sess");
 DATA.sessions.forEach((s,k)=>{ const o=document.createElement("option"); o.value=k; o.textContent=`${s.label}  (${s.date})`; sel.appendChild(o); });
 sel.onchange=()=>{ setPlaying(false); loadSession(+sel.value); };
@@ -755,7 +992,9 @@ resize();
 if __name__ == "__main__":
     warnings.simplefilter("ignore")
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    target = sys.argv[1] if len(sys.argv) > 1 else os.path.join(project_root, "data")
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    embed = "--embed-tiles" in sys.argv[1:]
+    target = args[0] if args else os.path.join(project_root, "data")
 
     if os.path.isfile(target):
         files = [target]
@@ -777,8 +1016,9 @@ if __name__ == "__main__":
     # Sessions nach Datum sortieren (Dateiname beginnt mit JJ-MM-TT)
     files = sorted(files, key=lambda f: os.path.basename(f))
 
-    out_file = os.path.join(project_root, "output", "replay.html")
-    build_replay(files, out_file, v_max)
+    out_name = "replay_offline.html" if embed else "replay.html"
+    out_file = os.path.join(project_root, "output", out_name)
+    build_replay(files, out_file, v_max, embed_tiles=embed)
 
     import webbrowser, pathlib
     webbrowser.open(pathlib.Path(out_file).resolve().as_uri())
